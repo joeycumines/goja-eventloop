@@ -22,10 +22,7 @@ import (
 
 func newArrayBufferTestAdapter(t *testing.T) (*Adapter, *goja.Runtime, func()) {
 	t.Helper()
-	loop, err := goeventloop.New()
-	if err != nil {
-		t.Fatalf("New loop failed: %v", err)
-	}
+	loop := goeventloop.New()
 
 	runtime := goja.New()
 	adapter, err := New(loop, runtime)

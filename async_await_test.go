@@ -18,10 +18,7 @@ func TestAsyncAwaitDrainsViaEventLoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	loop, err := goeventloop.New()
-	if err != nil {
-		t.Fatalf("failed to create loop: %v", err)
-	}
+	loop := goeventloop.New()
 	defer loop.Shutdown(context.Background())
 
 	runtime := goja.New()
@@ -69,10 +66,7 @@ func TestAsyncAwaitChain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	loop, err := goeventloop.New()
-	if err != nil {
-		t.Fatalf("failed to create loop: %v", err)
-	}
+	loop := goeventloop.New()
 	defer loop.Shutdown(context.Background())
 
 	runtime := goja.New()
@@ -122,10 +116,7 @@ func TestAsyncAwaitRejection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	loop, err := goeventloop.New()
-	if err != nil {
-		t.Fatalf("failed to create loop: %v", err)
-	}
+	loop := goeventloop.New()
 	defer loop.Shutdown(context.Background())
 
 	runtime := goja.New()
@@ -170,18 +161,13 @@ func TestAsyncAwaitRejection(t *testing.T) {
 	}
 }
 
-// TestAsyncAwaitMixedWithAdapterPromise verifies that async/await (native
-// goja promises) interoperate correctly with the adapter's ChainedPromise-based
-// Promise override. An async function awaiting a Promise created via the adapter
-// global should resolve correctly.
-func TestAsyncAwaitMixedWithAdapterPromise(t *testing.T) {
+// TestAsyncAwaitBoundNativePromiseResolve verifies that Bind retains Goja's
+// native Promise behavior while routing async/await jobs through the adapter.
+func TestAsyncAwaitBoundNativePromiseResolve(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	loop, err := goeventloop.New()
-	if err != nil {
-		t.Fatalf("failed to create loop: %v", err)
-	}
+	loop := goeventloop.New()
 	defer loop.Shutdown(context.Background())
 
 	runtime := goja.New()
@@ -199,10 +185,8 @@ func TestAsyncAwaitMixedWithAdapterPromise(t *testing.T) {
 		return goja.Undefined()
 	})
 
-	// The async function uses goja's native async/await (routed via the
-	// PromiseJobEnqueuer hook), while Promise.resolve uses the adapter's
-	// ChainedPromise implementation. The thenable interop path (resolveThenable)
-	// bridges the two promise systems.
+	// Both async/await and Promise.resolve use Goja's native Promise machinery;
+	// their jobs cross the adapter's canonical owner-safe enqueuer.
 	_, err = runtime.RunString(`
 		async function mixed() {
 			const result = await Promise.resolve(99);

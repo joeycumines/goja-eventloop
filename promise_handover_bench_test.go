@@ -1,79 +1,21 @@
 package gojaeventloop
 
-// Promise job handover benchmarks.
+// Promise job handover benchmarks measure native Goja async/await and Promise
+// reaction jobs, the adapter's canonical exit-gated handover, direct diagnostic
+// handover variants, and the event-loop scheduling floor. Bind retains Goja's
+// native Promise constructor and always installs the canonical handover.
 //
-// This file benchmarks the "promise job handover" — the path where goja's
-// native promise machinery (async/await, native Promise.then) calls our
-// enqueuer, which wraps the job in a closure and schedules it as a microtask
-// on the event loop:
-//
-//	runtime.SetPromiseJobEnqueuer(func(job func()) {
-//	    _ = loop.ScheduleMicrotask(func() {
-//	        _ = runtime.RunPromiseJob(job)
-//	    })
-//	})
-//
-// The per-job allocation is the inner closure `func() { ... }` which captures
-// `job` and `runtime`, escaping to the heap because it's stored in the
-// microtask ring buffer.
-//
-// === Benchmark Design Rationale ===
-//
-// 1. BenchmarkNativeAsyncAwaitResolve
-//    async/await WITHOUT adapter Bind(). Promise is goja's native.
-//    Isolates: goja native promise alloc + enqueuer closure + ScheduleMicrotask
-//              + RunPromiseJob + loop round-trip.
-//    Confounds: goja's newPromiseReactionJob closure, Promise object alloc,
-//               reaction record alloc. These are FIXED costs we can't optimize.
-//
-// 2. BenchmarkAdapterAsyncAwaitResolve
-//    async/await WITH adapter Bind(). Promise is overridden with ChainedPromise.
-//    When async/await awaits a Promise.resolve(), the thenable interop path
-//    (resolveThenable) adds extra allocations.
-//    Isolates: everything in #1 PLUS ChainedPromise interop overhead.
-//    The DELTA between #1 and #2 measures the ChainedPromise interop cost.
-//
-// 3. BenchmarkNativePromiseThenChain
-//    Native goja Promise.then chain (without Bind). Each .then() creates a
-//    reaction job that goes through the enqueuer.
-//    Isolates: 10x enqueuer invocations per iteration (high-throughput test).
-//    Confounds: same as #1, but multiplied by chain depth.
-//
-// 4. BenchmarkPromiseJobEnqueuerOverhead
-//    Calls the enqueuer DIRECTLY with a no-op job, bypassing goja's promise
-//    machinery entirely. No Promise objects, no reaction records, no
-//    newPromiseReactionJob closures.
-//    Isolates: JUST the enqueuer closure alloc + ScheduleMicrotask + RunPromiseJob
-//              + loop round-trip.
-//    THIS IS THE BENCHMARK THAT BEST ISOLATES THE HANDOVER COST.
-//
-// 5. BenchmarkScheduleMicrotaskBaseline
-//    Just loop.ScheduleMicrotask with a no-op function. No enqueuer closure,
-//    no RunPromiseJob. This is the FLOOR — the minimum scheduling cost.
-//    The DELTA between #4 and #5 measures: enqueuer closure alloc + RunPromiseJob
-//    overhead.
-//
-// === Confounding Factors Addressed ===
-//
-// - loop.Run(ctx) overhead: minimized by channel-based warmup (no time.Sleep),
-//   and by using a single long-lived loop goroutine across all iterations.
-// - RACE CONDITION: RunProgram and RunPromiseJob both access the goja runtime,
-//   which is NOT goroutine-safe. The async/await benchmarks (#1-#3) use
-//   loop.Submit to run RunProgram ON the loop goroutine, ensuring sequential
-//   access. The enqueuer overhead benchmarks (#4-#5) don't access the runtime
-//   from the test goroutine, so they call the enqueuer directly.
-// - Channel signaling overhead: present in all benchmarks as a constant, so
-//   deltas between benchmarks are meaningful.
-// - GC pressure: goruntime.GC() called before b.ResetTimer() to start clean.
-// - Script compilation: pre-compiled with goja.Compile() before the benchmark
-//   loop; only RunProgram() is called per iteration (via loop.Submit).
-// - Goroutine scheduling: the loop goroutine processes microtasks after the
-//   submitted RunProgram task returns, ensuring no concurrent runtime access.
+// All direct runtime setup finishes before the loop starts. Once callbacks may
+// run, bound product measurements submit through Adapter.Submit and unbound
+// component diagnostics use the loop's serialized logical callback owner.
 
 import (
 	"context"
+	"errors"
 	goruntime "runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,88 +25,234 @@ import (
 
 // benchEnv holds the test fixture for a benchmark run.
 type benchEnv struct {
-	loop    *goeventloop.Loop
-	runtime *goja.Runtime
-	adapter *Adapter
-	wg      sync.WaitGroup
+	loop         *goeventloop.Loop
+	runtime      *goja.Runtime
+	adapter      *Adapter
+	runDone      chan error
+	promiseErrCh chan error
+	cleanupOnce  sync.Once
+	runStarted   bool
+	bound        bool
 }
 
-// setupBenchEnv creates a loop, runtime, and adapter (optionally bound),
-// starts the loop goroutine, and performs a channel-based warmup.
-// The bind parameter controls whether adapter.Bind() is called (which
-// overrides the global Promise constructor with ChainedPromise).
-func setupBenchEnv(b *testing.B, bind bool) *benchEnv {
-	b.Helper()
+func newBenchEnv(tb testing.TB) *benchEnv {
+	tb.Helper()
 
-	loop, err := goeventloop.New()
-	if err != nil {
-		b.Fatalf("failed to create loop: %v", err)
+	loop := goeventloop.New()
+	env := &benchEnv{
+		loop:         loop,
+		runDone:      make(chan error, 1),
+		promiseErrCh: make(chan error, 1),
 	}
+	tb.Cleanup(func() { env.teardown(tb) })
 
 	rt := goja.New()
 	adapter, err := New(loop, rt)
 	if err != nil {
-		b.Fatalf("failed to create adapter: %v", err)
+		tb.Fatalf("failed to create adapter: %v", err)
 	}
+	env.runtime = rt
+	env.adapter = adapter
+	return env
+}
 
-	if bind {
-		if err := adapter.Bind(); err != nil {
-			b.Fatalf("failed to bind adapter: %v", err)
+func newDiagnosticBenchEnv(tb testing.TB, implementation promiseJobHandoverImplementation) *benchEnv {
+	tb.Helper()
+	env := newBenchEnv(tb)
+	implementation.install(env.loop, env.runtime, env.adapter, func(err error) {
+		select {
+		case env.promiseErrCh <- err:
+		default:
 		}
+	})
+	return env
+}
+
+func newBoundBenchEnv(tb testing.TB) *benchEnv {
+	tb.Helper()
+	env := newBenchEnv(tb)
+	if err := env.adapter.Bind(); err != nil {
+		tb.Fatalf("failed to bind adapter: %v", err)
 	}
+	env.bound = true
+	return env
+}
 
-	env := &benchEnv{
-		loop:    loop,
-		runtime: rt,
-		adapter: adapter,
+// start transfers runtime access after benchmark-specific setup to the
+// serialized logical callback owner.
+func (e *benchEnv) start(tb testing.TB) {
+	tb.Helper()
+	if e.runStarted {
+		tb.Fatal("benchmark loop started more than once")
 	}
+	e.runStarted = true
+	go func() { e.runDone <- e.loop.Run(context.Background()) }()
 
-	// Start the loop goroutine. Run blocks until the loop is shut down.
-	env.wg.Go(func() { _ = loop.Run(context.Background()) })
-
-	// Channel-based warmup — no time.Sleep.
-	// Confirms the loop goroutine is running and ready to process microtasks.
 	warmupDone := make(chan struct{})
-	if err := loop.ScheduleMicrotask(func() { close(warmupDone) }); err != nil {
-		b.Fatalf("warmup ScheduleMicrotask failed: %v", err)
+	if err := e.loop.ScheduleMicrotask(func() { close(warmupDone) }); err != nil {
+		tb.Fatalf("warmup ScheduleMicrotask failed: %v", err)
 	}
 	select {
 	case <-warmupDone:
 	case <-time.After(2 * time.Second):
-		b.Fatal("warmup timeout: loop did not process microtask")
+		tb.Fatal("warmup timeout: loop did not process microtask")
 	}
-
-	return env
 }
 
 // teardown shuts down the loop and waits for the goroutine to exit.
-func (e *benchEnv) teardown(b *testing.B) {
-	b.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := e.loop.Shutdown(ctx); err != nil {
-		b.Fatalf("loop shutdown failed: %v", err)
-	}
-	e.wg.Wait()
+func (e *benchEnv) teardown(tb testing.TB) {
+	tb.Helper()
+	e.cleanupOnce.Do(func() {
+		if !e.runStarted {
+			if err := awaitBenchmarkLifecycle(e.loop.Close, 5*time.Second); err != nil && !errors.Is(err, goeventloop.ErrLoopTerminated) {
+				tb.Errorf("loop Close failed: %v", err)
+			}
+			return
+		}
+		result := terminateBenchmarkLoop(e.loop, e.runDone, 5*time.Second)
+		if result.shutdownErr != nil && !errors.Is(result.shutdownErr, goeventloop.ErrLoopTerminated) {
+			tb.Errorf("loop Shutdown failed: %v", result.shutdownErr)
+		}
+		if result.closeErr != nil && !errors.Is(result.closeErr, goeventloop.ErrLoopTerminated) {
+			tb.Errorf("loop fallback Close failed: %v", result.closeErr)
+		}
+		if result.runErr != nil {
+			tb.Errorf("loop Run failed: %v", result.runErr)
+		}
+	})
 }
 
-// runOnLoop submits fn to the loop goroutine and returns a channel that
-// receives fn's error (or nil on success). This is necessary because
-// RunProgram and RunPromiseJob both access the goja runtime, which is NOT
-// goroutine-safe. By running RunProgram on the loop goroutine via Submit,
-// we ensure that RunProgram completes before the loop processes any microtasks
-// (which call RunPromiseJob), eliminating the race.
-func (e *benchEnv) runOnLoop(fn func() error) <-chan error {
+func (e *benchEnv) runOnOwner(fn func(*goja.Runtime) error) <-chan error {
 	errCh := make(chan error, 1)
-	_ = e.loop.Submit(func() {
-		errCh <- fn()
-	})
+	var err error
+	if e.bound {
+		err = e.adapter.Submit(func(runtime *goja.Runtime) {
+			errCh <- fn(runtime)
+		})
+	} else {
+		err = e.loop.Submit(func() {
+			errCh <- fn(e.runtime)
+		})
+	}
+	if err != nil {
+		errCh <- err
+	}
 	return errCh
 }
 
-// BenchmarkNativeAsyncAwaitResolve measures async/await WITHOUT adapter Bind().
-// Promise is goja's native implementation. This isolates the enqueuer handover
-// from the ChainedPromise interop path.
+func (e *benchEnv) waitOperation(tb testing.TB, result <-chan error, deadline <-chan time.Time, label string) {
+	tb.Helper()
+	select {
+	case err := <-e.promiseErrCh:
+		tb.Fatalf("%s promise job failed: %v", label, err)
+	case err := <-result:
+		if err != nil {
+			tb.Fatalf("%s failed: %v", label, err)
+		}
+	case <-deadline:
+		tb.Fatalf("%s timed out", label)
+	}
+}
+
+func (e *benchEnv) waitPromiseResult(tb testing.TB, resultCh <-chan int64, deadline <-chan time.Time, label string) int64 {
+	tb.Helper()
+	select {
+	case err := <-e.promiseErrCh:
+		tb.Fatalf("%s promise job failed: %v", label, err)
+		return 0
+	case v := <-resultCh:
+		return v
+	case <-deadline:
+		tb.Fatalf("%s result timed out", label)
+		return 0
+	}
+}
+
+func (e *benchEnv) waitIterationTail(tb testing.TB, deadline <-chan time.Time, label string) {
+	tb.Helper()
+	done, err := e.scheduleIterationTail()
+	if err != nil {
+		tb.Fatalf("%s checkpoint admission failed: %v", label, err)
+	}
+	select {
+	case err := <-e.promiseErrCh:
+		tb.Fatalf("%s promise job failed: %v", label, err)
+	case <-done:
+	case <-deadline:
+		tb.Fatalf("%s checkpoint timed out", label)
+	}
+	select {
+	case err := <-e.promiseErrCh:
+		tb.Fatalf("%s late promise job failed: %v", label, err)
+	default:
+	}
+}
+
+func (e *benchEnv) scheduleIterationTail() (<-chan struct{}, error) {
+	done := make(chan struct{})
+	if err := e.loop.ScheduleMicrotaskCheckpoint(func() { close(done) }); err != nil {
+		return nil, err
+	}
+	return done, nil
+}
+
+func (e *benchEnv) waitDone(tb testing.TB, done <-chan struct{}, deadline <-chan time.Time, label string) {
+	tb.Helper()
+	select {
+	case err := <-e.promiseErrCh:
+		tb.Fatalf("%s promise job failed: %v", label, err)
+	case <-done:
+	case <-deadline:
+		tb.Fatalf("%s timed out", label)
+	}
+}
+
+func TestPromiseJobBenchmarkIterationTailWaitsJobReturn(t *testing.T) {
+	env := newDiagnosticBenchEnv(t, promiseJobHandoverExitGated)
+	env.start(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var returned atomic.Bool
+	enqueue := promiseJobHandoverExitGated.direct(env.loop, env.runtime, env.adapter, func(err error) {
+		select {
+		case env.promiseErrCh <- err:
+		default:
+		}
+	})
+	enqueue(func() {
+		close(entered)
+		<-release
+		returned.Store(true)
+	})
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	env.waitDone(t, entered, deadline.C, "promise job entry")
+	tail, err := env.scheduleIterationTail()
+	if err != nil {
+		t.Fatalf("schedule iteration tail: %v", err)
+	}
+	select {
+	case <-tail:
+		t.Fatal("iteration tail ran before Promise job returned")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-env.promiseErrCh:
+		t.Fatalf("Promise job failed: %v", err)
+	case <-tail:
+	case <-deadline.C:
+		t.Fatal("iteration tail did not run after Promise job returned")
+	}
+	if !returned.Load() {
+		t.Fatal("iteration tail ran before Promise job return was published")
+	}
+}
+
+// BenchmarkNativeAsyncAwaitResolve measures an unbound component fixture using
+// Goja's native Promise implementation and the canonical handover directly.
 //
 // Per iteration: 1 async function call -> 1 await -> 1 promise job via enqueuer.
 //
@@ -176,8 +264,11 @@ func (e *benchEnv) runOnLoop(fn func() error) <-chan error {
 //	are included but are FIXED costs (not optimizable in adapter.go).
 //	loop.Submit overhead is also included (task queue push + wakeup).
 func BenchmarkNativeAsyncAwaitResolve(b *testing.B) {
-	env := setupBenchEnv(b, false) // no Bind — native Promise
-	defer env.teardown(b)
+	benchmarkNativeAsyncAwaitResolve(b, promiseJobHandoverExitGated)
+}
+
+func benchmarkNativeAsyncAwaitResolve(b *testing.B, implementation promiseJobHandoverImplementation) {
+	env := newDiagnosticBenchEnv(b, implementation)
 
 	// Pre-compile the async function definition
 	defProgram, err := goja.Compile("define", `
@@ -205,50 +296,42 @@ func BenchmarkNativeAsyncAwaitResolve(b *testing.B) {
 		resultCh <- call.Argument(0).ToInteger()
 		return goja.Undefined()
 	})
+	env.start(b)
 
 	goruntime.GC() // start with clean heap
 	b.ReportAllocs()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		// Run RunProgram on the loop goroutine to avoid concurrent runtime access.
-		// After RunProgram returns, the loop processes the enqueued microtask
-		// (RunPromiseJob), which resumes the async function and calls reportResult.
-		errCh := env.runOnLoop(func() error {
-			_, err := env.runtime.RunProgram(callProgram)
+	for range b.N {
+		// The serialized callback owner runs the program before its queued
+		// Promise job resumes the async function.
+		errCh := env.runOnOwner(func(runtime *goja.Runtime) error {
+			_, err := runtime.RunProgram(callProgram)
 			return err
 		})
 		// Phase 1: wait for RunProgram to complete (nil error = success)
-		if err := <-errCh; err != nil {
-			b.Fatalf("iteration %d: RunProgram failed: %v", i, err)
+		env.waitOperation(b, errCh, deadline.C, "native async/await RunProgram")
+		// Phase 2: wait for the async result (microtask processed by loop).
+		v := env.waitPromiseResult(b, resultCh, deadline.C, "native async/await")
+		if v != 42 {
+			b.Fatalf("expected 42, got %d", v)
 		}
-		// Phase 2: wait for the async result (microtask processed by loop)
-		select {
-		case v := <-resultCh:
-			if v != 42 {
-				b.Fatalf("expected 42, got %d", v)
-			}
-		case <-time.After(5 * time.Second):
-			b.Fatalf("iteration %d: timeout waiting for async result", i)
-		}
+		env.waitIterationTail(b, deadline.C, "native async/await")
 	}
+	b.StopTimer()
 }
 
-// BenchmarkAdapterAsyncAwaitResolve measures async/await WITH adapter Bind().
-// Promise is overridden with ChainedPromise-based implementation.
-// When async/await awaits a Promise.resolve(), the thenable interop path
-// (resolveThenable) is taken, adding extra allocations.
-//
-// Per iteration: 1 async function call -> 1 await -> thenable interop + promise job.
-//
-// Measures: adapter ChainedPromise alloc + resolveThenable + enqueuer closure alloc
-//   - ScheduleMicrotask + loop round-trip + RunPromiseJob + channel signaling.
-//
-// The DELTA between this and BenchmarkNativeAsyncAwaitResolve measures the
-// ChainedPromise interop cost (resolveThenable, GojaWrapPromise, etc.).
+// BenchmarkAdapterAsyncAwaitResolve measures the bound product path: Goja's
+// native Promise constructor and the canonical exit-gated handover installed
+// atomically by Bind.
 func BenchmarkAdapterAsyncAwaitResolve(b *testing.B) {
-	env := setupBenchEnv(b, true) // with Bind — ChainedPromise
-	defer env.teardown(b)
+	benchmarkAdapterAsyncAwaitResolve(b)
+}
+
+func benchmarkAdapterAsyncAwaitResolve(b *testing.B) {
+	env := newBoundBenchEnv(b)
 
 	defProgram, err := goja.Compile("define", `
 		async function compute() {
@@ -273,28 +356,27 @@ func BenchmarkAdapterAsyncAwaitResolve(b *testing.B) {
 		resultCh <- call.Argument(0).ToInteger()
 		return goja.Undefined()
 	})
+	env.start(b)
 
 	goruntime.GC()
 	b.ReportAllocs()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		errCh := env.runOnLoop(func() error {
-			_, err := env.runtime.RunProgram(callProgram)
+	for range b.N {
+		errCh := env.runOnOwner(func(runtime *goja.Runtime) error {
+			_, err := runtime.RunProgram(callProgram)
 			return err
 		})
-		if err := <-errCh; err != nil {
-			b.Fatalf("iteration %d: RunProgram failed: %v", i, err)
+		env.waitOperation(b, errCh, deadline.C, "adapter async/await RunProgram")
+		v := env.waitPromiseResult(b, resultCh, deadline.C, "adapter async/await")
+		if v != 42 {
+			b.Fatalf("expected 42, got %d", v)
 		}
-		select {
-		case v := <-resultCh:
-			if v != 42 {
-				b.Fatalf("expected 42, got %d", v)
-			}
-		case <-time.After(5 * time.Second):
-			b.Fatalf("iteration %d: timeout waiting for async result", i)
-		}
+		env.waitIterationTail(b, deadline.C, "adapter async/await")
 	}
+	b.StopTimer()
 }
 
 // BenchmarkNativePromiseThenChain measures a chain of native goja Promise.then()
@@ -311,21 +393,34 @@ func BenchmarkAdapterAsyncAwaitResolve(b *testing.B) {
 //
 // The chainDepth constant can be adjusted to scale the enqueuer workload.
 func BenchmarkNativePromiseThenChain(b *testing.B) {
-	env := setupBenchEnv(b, false) // no Bind — native Promise
-	defer env.teardown(b)
+	benchmarkNativePromiseThenChain(b, promiseJobHandoverExitGated)
+}
+
+// BenchmarkAdapterPromiseThenChain measures the corresponding bound product
+// path with the canonical handover selected by Bind.
+func BenchmarkAdapterPromiseThenChain(b *testing.B) {
+	benchmarkPromiseThenChain(b, newBoundBenchEnv(b), "adapter")
+}
+
+func benchmarkNativePromiseThenChain(b *testing.B, implementation promiseJobHandoverImplementation) {
+	benchmarkPromiseThenChain(b, newDiagnosticBenchEnv(b, implementation), "native")
+}
+
+func benchmarkPromiseThenChain(b *testing.B, env *benchEnv, label string) {
 
 	const chainDepth = 10
 
 	// Build: Promise.resolve(0).then(x=>x+1).then(x=>x+1)...then(reportResult)
-	jsCode := "Promise.resolve(0)"
+	var jsCode strings.Builder
+	jsCode.WriteString("Promise.resolve(0)")
 	for range chainDepth {
-		jsCode += ".then(x => x + 1)"
+		jsCode.WriteString(".then(x => x + 1)")
 	}
-	jsCode += ".then(reportResult)"
+	jsCode.WriteString(".then(reportResult)")
 
 	defProgram, err := goja.Compile("define", `
 		function runChain() {
-			`+jsCode+`;
+			`+jsCode.String()+`;
 		}
 	`, false)
 	if err != nil {
@@ -345,103 +440,128 @@ func BenchmarkNativePromiseThenChain(b *testing.B) {
 		resultCh <- call.Argument(0).ToInteger()
 		return goja.Undefined()
 	})
+	env.start(b)
 
 	goruntime.GC()
 	b.ReportAllocs()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		errCh := env.runOnLoop(func() error {
-			_, err := env.runtime.RunProgram(callProgram)
+	for range b.N {
+		errCh := env.runOnOwner(func(runtime *goja.Runtime) error {
+			_, err := runtime.RunProgram(callProgram)
 			return err
 		})
-		if err := <-errCh; err != nil {
-			b.Fatalf("iteration %d: RunProgram failed: %v", i, err)
+		env.waitOperation(b, errCh, deadline.C, label+" promise chain RunProgram")
+		v := env.waitPromiseResult(b, resultCh, deadline.C, label+" promise chain")
+		if v != int64(chainDepth) {
+			b.Fatalf("expected %d, got %d", chainDepth, v)
 		}
-		select {
-		case v := <-resultCh:
-			if v != int64(chainDepth) {
-				b.Fatalf("expected %d, got %d", chainDepth, v)
-			}
-		case <-time.After(5 * time.Second):
-			b.Fatalf("iteration %d: timeout waiting for chain result", i)
-		}
+		env.waitIterationTail(b, deadline.C, label+" promise chain")
 	}
+	b.StopTimer()
 }
 
 // BenchmarkPromiseJobEnqueuerOverhead isolates the enqueuer handover cost by
 // calling the enqueuer directly with a no-op job, bypassing goja's promise
-// machinery (no Promise objects, reaction records, or newPromiseReactionJob
-// closures). It replicates the exact closure pattern shipped by the adapter
-// (newPromiseJobEnqueuer in adapter.go), so it measures what the production
-// code actually pays per promise job.
-//
-// Measures: closure alloc (1 heap object) + ScheduleMicrotask + RunPromiseJob
-//   - loop round-trip.
-//
-// The DELTA between this and BenchmarkScheduleMicrotaskBaseline measures the
-// enqueuer closure allocation + RunPromiseJob overhead — the cost the closure
-// pattern adds on top of bare microtask scheduling. A queue+drainOne variant
-// that eliminates the per-job closure alloc was evaluated and rejected: it
-// introduces a secondary FIFO queue that is architecturally inconsistent with
-// the rest of the codebase (every ScheduleMicrotask caller uses a closure),
-// for a marginal ~1.5% reduction in async/await allocations.
+// machinery. Reported allocations and latency include direct handover,
+// ScheduleMicrotask, RunPromiseJob, callback-owner transfer, and signaling.
 func BenchmarkPromiseJobEnqueuerOverhead(b *testing.B) {
-	env := setupBenchEnv(b, false) // enqueuer is set by New() regardless of Bind
-	defer env.teardown(b)
+	benchmarkPromiseJobEnqueuerOverhead(b, promiseJobHandoverExitGated)
+}
 
-	// Replicate the exact enqueuer closure from adapter.go
+func benchmarkPromiseJobEnqueuerOverhead(b *testing.B, implementation promiseJobHandoverImplementation) {
+	env := newDiagnosticBenchEnv(b, implementation)
+
 	rt := env.runtime
 	loop := env.loop
-	enqueuer := func(job func()) {
-		_ = loop.ScheduleMicrotask(func() {
-			_ = rt.RunPromiseJob(job)
-		})
-	}
+	enqueuer := implementation.direct(loop, rt, env.adapter, func(err error) {
+		select {
+		case env.promiseErrCh <- err:
+		default:
+		}
+	})
 
 	// Reusable completion channel — avoids per-iteration channel allocation
 	done := make(chan struct{}, 1)
+	env.start(b)
 
 	goruntime.GC()
 	b.ReportAllocs()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		enqueuer(func() {
 			select {
 			case done <- struct{}{}:
 			default:
 			}
 		})
-		<-done
+		env.waitDone(b, done, deadline.C, "promise job enqueuer")
+		env.waitIterationTail(b, deadline.C, "promise job enqueuer")
 	}
+	b.StopTimer()
 }
 
-// BenchmarkScheduleMicrotaskBaseline measures JUST the ScheduleMicrotask path
-// without the enqueuer closure wrapping or RunPromiseJob. This is the floor —
-// the minimum possible cost for scheduling work on the loop.
-//
-// The DELTA between BenchmarkPromiseJobEnqueuerOverhead and this benchmark
-// measures: enqueuer closure allocation + RunPromiseJob overhead.
-//
-// Per iteration: 1 ScheduleMicrotask call -> 1 microtask -> 1 callback.
+// BenchmarkScheduleMicrotaskBaseline is the scheduling floor. It omits Promise
+// creation, handover wrapping, and RunPromiseJob.
 func BenchmarkScheduleMicrotaskBaseline(b *testing.B) {
-	env := setupBenchEnv(b, false)
-	defer env.teardown(b)
+	env := newDiagnosticBenchEnv(b, promiseJobHandoverExitGated)
 
 	done := make(chan struct{}, 1)
+	env.start(b)
 
 	goruntime.GC()
 	b.ReportAllocs()
+	deadline := time.NewTimer(30 * time.Minute)
+	defer deadline.Stop()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		_ = env.loop.ScheduleMicrotask(func() {
+	for range b.N {
+		if err := env.loop.ScheduleMicrotask(func() {
 			select {
 			case done <- struct{}{}:
 			default:
 			}
+		}); err != nil {
+			b.Fatalf("ScheduleMicrotask failed: %v", err)
+		}
+		env.waitDone(b, done, deadline.C, "ScheduleMicrotask baseline")
+		env.waitIterationTail(b, deadline.C, "ScheduleMicrotask baseline")
+	}
+	b.StopTimer()
+}
+
+func BenchmarkPromiseJobHandoverNativeAsyncAwaitResolve(b *testing.B) {
+	for _, implementation := range promiseJobHandoverBenchmarkImplementations() {
+		b.Run(implementation.id, func(b *testing.B) {
+			benchmarkNativeAsyncAwaitResolve(b, implementation)
 		})
-		<-done
+	}
+}
+
+func BenchmarkPromiseJobHandoverAdapterAsyncAwaitResolve(b *testing.B) {
+	b.Run(promiseJobHandoverExitGated.id, benchmarkAdapterAsyncAwaitResolve)
+}
+
+func BenchmarkPromiseJobHandoverNativePromiseThenChain(b *testing.B) {
+	for _, implementation := range promiseJobHandoverBenchmarkImplementations() {
+		b.Run(implementation.id, func(b *testing.B) {
+			benchmarkNativePromiseThenChain(b, implementation)
+		})
+	}
+}
+
+func BenchmarkPromiseJobHandoverEnqueuerOverhead(b *testing.B) {
+	for _, implementation := range promiseJobHandoverBenchmarkImplementations() {
+		if implementation.direct == nil {
+			continue
+		}
+		b.Run(implementation.id, func(b *testing.B) {
+			benchmarkPromiseJobEnqueuerOverhead(b, implementation)
+		})
 	}
 }
